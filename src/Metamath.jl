@@ -1,13 +1,13 @@
-__precompile__()
+# __precompile__()
 module Metamath
 
-using Compat
-
+using Mmap
+using Unicode
 import Base: empty!, show
 
 export mmverify!
 
-type MetamathException <: Exception
+mutable struct MetamathException <: Exception
   text::AbstractString
 end
 metamath_error(x...) = throw(MetamathException(string(x...)))
@@ -16,41 +16,40 @@ macro warn_and_ret(rv,x...)
   :(metamath_warn($x...) ; return $rv)
 end
 
-typealias Expression Vector{Symbol}
-typealias Hypothesis Pair{Expression,Bool}
+const Expression = Vector{String}
+const Hypothesis = Pair{Expression,Bool}
 
 # An axiom or theorem
-immutable Assertion
-  hypotheses::Vector{Symbol}
-  disjvars::Set{Pair{Symbol,Symbol}}
+struct Assertion
+  hypotheses::Vector{String}
+  disjvars::Set{Pair{String,String}}
   expression::Expression
-  Assertion(expression) = new(Symbol[],Set{Pair{Symbol,Symbol}}(),expression)
+  Assertion(expression) = new(String[],Set{Pair{String,String}}(),expression)
 end
 
-type Scope
-  activevariables::Set{Symbol}
-  activehyp::Vector{Symbol}
-  disjvars::Vector{Set{Symbol}}
-  floatinghyp::Dict{Symbol,Symbol}
-  Scope() = new(Set{Symbol}(),Symbol[],Set{Symbol}[],Dict{Symbol,Symbol}())
+mutable struct Scope
+  activevariables::Set{String}
+  activehyp::Vector{String}
+  disjvars::Vector{Set{String}}
+  floatinghyp::Dict{String,String}
+  Scope() = new(Set{String}(),String[],Set{String}[],Dict{String,String}())
 end
 
 # An environment holding truths and definitions accumulated by verifier
-immutable Environment
+struct Environment
   filenames::Set{String}
-  tokens::Vector{Symbol}
+  tokens::Vector{String}
   compressedproofs::Vector{String}
-  constants::Set{Symbol}
-  hypotheses::Dict{Symbol,Hypothesis}
-  variables::Set{Symbol}
-  assertions::Dict{Symbol,Assertion}
+  constants::Set{String}
+  hypotheses::Dict{String,Hypothesis}
+  variables::Set{String}
+  assertions::Dict{String,Assertion}
   scopes::Vector{Scope}
-  substitutionssrc::Vector{Symbol}
-  substitutionsdst::Vector{Expression}
+  substitutions::Dict{String,Expression}
   dirty::Vector{Bool}
-  Environment() = new(Set{String}(),Symbol[],String[],Set{Symbol}(),
-    Dict{Symbol,Hypothesis}(), Set{Symbol}(), Dict{Symbol,Assertion}(),
-    Scope[Scope()],Symbol[],Expression[],Bool[false])
+  Environment() = new(Set{String}(),String[],String[],Set{String}(),
+    Dict{String,Hypothesis}(), Set{String}(), Dict{String,Assertion}(),
+    Scope[Scope()],Dict{String,Expression}(),Bool[false])
 end
 
 """a global Metamath.Environment variable for defualt use by mmverify!"""
@@ -75,15 +74,15 @@ const tokenspecials = Set(['.','-','_'])
 # true if ch is a Metamath whitespace
 ismmws(ch) = return ch == ' ' || ch == '\n' || ch == '\t' || ch == '\f' || ch == '\r'
 # true if sym represent a string which is legal Metamath label
-islabeltoken(str) = findfirst(c->!(c in tokenspecials || isalnum(c)),str)==0
+islabeltoken(str) = findfirst(c->!(c in tokenspecials || isletter(c) || isnumeric(c)),str)==nothing
 # true if str is a legal Metamath symbol
-ismathsymboltoken(str::String) = findfirst(str,'$')==0
-# true is sym represents a string which is legal Metamth symbol
-ismathsymboltoken(sym::Symbol) = ismathsymboltoken(string(sym))
+ismathsymboltoken(str::String) = findfirst("\$",str)==nothing
+# # true is sym represents a string which is legal Metamth symbol
+# ismathsymboltoken(sym::Symbol) = ismathsymboltoken(string(sym))
 # true if c is not uppercase or question mark
-isntupperorq(c) = !(isupper(c) || c=='?')
+isntupperorq(c) = !(isuppercase(c) || c=='?')
 # true is str has only upper-case letters or question marks
-containsonlyupperorq(str) = findfirst(isntupperorq,str)==0
+containsonlyupperorq(str) = findfirst(isntupperorq,str)==nothing
 
 # true if str is an active variable according to env
 isactivevariable(env,str) = any(scope->str in scope.activevariables,env.scopes)
@@ -164,11 +163,11 @@ function readtokens!(env, filename; use_mmap::Bool=true)
         incomment = false
         continue
       end
-      if !isempty(search(strtoken,"\$("))
+      if occursin("\$(",strtoken)
         metamath_error("Character \$( found in comment")
       end
-      if !isempty(search(strtoken,"\$)"))
-        metamath_error("Character \$) found in comment")
+      if occursin("\$)",strtoken)
+        metamath_error("Character \$) found in comment as part of a larger non-white space string")
       end
       continue
     end
@@ -180,7 +179,7 @@ function readtokens!(env, filename; use_mmap::Bool=true)
 
     if infileinclusion
       if newfilename == ""
-        if findfirst(strtoken,'$')!=0
+        if findfirst('$',strtoken)!=0
           metamath_error("Filename contains a \$")
         end
         newfilename = strtoken
@@ -222,7 +221,7 @@ function readtokens!(env, filename; use_mmap::Bool=true)
     elseif state > 0 && strtoken == "\$."
       state = 0
     end
-    push!(env.tokens,Symbol(strtoken))
+    push!(env.tokens,strtoken)
   end
   if !eof(stream)
     metamath_error("Error reading from $filename")
@@ -233,7 +232,7 @@ function readtokens!(env, filename; use_mmap::Bool=true)
   if infileinclusion
     metamath_error("Unfinished file inclusion command in $filename")
   end
-  if state > 0 || nb_available(compressedbuf) != 0
+  if state > 0 || bytesavailable(compressedbuf) != 0
     metamath_error("Compressed proof parsing confused in $filename")
   end
   return nothing
@@ -244,7 +243,7 @@ end
 # into environment and returned
 function constructassertion(env,label, expression)
   assertion = Assertion(expression)
-  varsused = Set{Symbol}()
+  varsused = Set{String}()
   for token in expression
     if token in env.variables
       push!(varsused, token)
@@ -255,9 +254,9 @@ function constructassertion(env,label, expression)
       ind = Base.ht_keyindex(env.hypotheses,hyp)
       if ind != -1
         if last(env.hypotheses.vals[ind]) && (first(env.hypotheses.vals[ind])[2] in varsused)
-          unshift!(assertion.hypotheses,hyp)
+          pushfirst!(assertion.hypotheses,hyp)
         elseif !last(env.hypotheses.vals[ind])
-          unshift!(assertion.hypotheses,hyp)
+          pushfirst!(assertion.hypotheses,hyp)
           for token in first(env.hypotheses.vals[ind])
             if token in env.variables
               push!(varsused, token)
@@ -288,14 +287,14 @@ function readexpression!(env,stattype::Char, label, terminator)
   if isempty(env.tokens)
     metamath_error("Unfinished \$$stattype statement $label")
   end
-  token = shift!(env.tokens)
+  token = popfirst!(env.tokens)
   if !(token in env.constants)
     metamath_error("First symbol in \$$stattype statement $label"*
       " is $token which is not a constant")
   end
   push!(expression, token)
   while !isempty(env.tokens)
-    token = shift!(env.tokens)
+    token = popfirst!(env.tokens)
     if token == terminator
       break
     end
@@ -353,12 +352,11 @@ end
 
 # Perform substitutions of variables specified in substmap and return
 # resulting Expression
-function makesubstitution(original, substmapsrc, substmapdst)
+function makesubstitution(original, substitutions)
   destination = Expression()
   for token in original
-    ind = findfirst(substmapsrc,token)
-    if ind != 0
-      append!(destination,substmapdst[ind])
+    if haskey(substitutions, token)
+      append!(destination,substitutions[token])
     else
       push!(destination,token)
     end
@@ -374,9 +372,7 @@ function verifyassertionref(env, thlabel, reflabel, stack)
       " items found on stack")
   end
   base = length(stack)-length(assertion.hypotheses)
-  # empty!(substitutions)
-  empty!(env.substitutionssrc)
-  empty!(env.substitutionsdst)
+  empty!(env.substitutions)
   for i=1:length(assertion.hypotheses)
     hypothesis = env.hypotheses[assertion.hypotheses[i]]
     if last(hypothesis)
@@ -386,13 +382,13 @@ function verifyassertionref(env, thlabel, reflabel, stack)
           " unification failed")
       end
       subst = copy(stack[base+i])
-      shift!(subst)
-      # substitutions[first(hypothesis)[2]] = subst
-      push!(env.substitutionssrc,first(hypothesis)[2])
-      push!(env.substitutionsdst,subst)
+      popfirst!(subst)
+      env.substitutions[first(hypothesis)[2]] = subst
+      # push!(env.substitutionssrc,first(hypothesis)[2])
+      # push!(env.substitutionsdst,subst)
     else
       # Essential hypothesis
-      dest = makesubstitution(first(hypothesis),env.substitutionssrc,env.substitutionsdst)
+      dest = makesubstitution(first(hypothesis),env.substitutions)
       if dest != stack[base+i]
         metamath_error("In proof of theorem $thlabel unification failed")
       end
@@ -401,16 +397,18 @@ function verifyassertionref(env, thlabel, reflabel, stack)
   resize!(stack,base)
   # Verify disjoint variable conditions
   for vpair in assertion.disjvars
-    exp1 = env.substitutionsdst[findfirst(env.substitutionssrc,first(vpair))]
-    exp2 = env.substitutionsdst[findfirst(env.substitutionssrc,last(vpair))]
+    exp1 = env.substitutions[first(vpair)]
+    exp2 = env.substitutions[last(vpair)]
+    # exp1 = env.substitutionsdst[findfirst(env.substitutionssrc,first(vpair))]
+    # exp2 = env.substitutionsdst[findfirst(env.substitutionssrc,last(vpair))]
     # exp2 = substitutions[last(vpair)]
-    exp1vars = Set{Symbol}()
+    exp1vars = Set{String}()
     for token in exp1
       if token in env.variables
         push!(exp1vars,token)
       end
     end
-    exp2vars = Set{Symbol}()
+    exp2vars = Set{String}()
     for token in exp2
       if token in env.variables
         push!(exp2vars,token)
@@ -425,7 +423,7 @@ function verifyassertionref(env, thlabel, reflabel, stack)
       end
     end
   end
-  dest = makesubstitution(assertion.expression, env.substitutionssrc, env.substitutionsdst)
+  dest = makesubstitution(assertion.expression, env.substitutions)
   push!(stack,dest)
   return nothing
 end
@@ -490,19 +488,19 @@ end
 
 # Parse $p statement
 function parsep!(env,label)
-  newtheorem = readexpression!(env,'p', label, Symbol("\$="))
+  newtheorem = readexpression!(env,'p', label, "\$=")
   assertion = constructassertion(env,label, newtheorem)
   env.assertions[label] = assertion
   if isempty(env.tokens)
     metamath_error("Unfinished \$p statement")
   end
-  token = shift!(env.tokens)
-  if token == Symbol("(")
+  token = popfirst!(env.tokens)
+  if token == "("
     # Compressed proof
-    labels = Vector{Symbol}()
+    labels = Vector{String}()
     while !isempty(env.tokens)
-      token = shift!(env.tokens)
-      if token == Symbol(")")
+      token = popfirst!(env.tokens)
+      if token == ")"
         break
       end
       push!(labels, token)
@@ -522,28 +520,28 @@ function parsep!(env,label)
     if isempty(env.compressedproofs)
       metamath_error("Missing compressed proof for $label")
     end
-    proof = shift!(env.compressedproofs)
+    proof = popfirst!(env.compressedproofs)
     if isempty(proof)
       metamath_error("Theorem $label has no proof")
     end
-    if findfirst(proof,'?')!=0
+    if findfirst("?",proof)!=nothing
       metamath_error("Proof of theorem $label is incomplete")
     end
     proofnumbers = getproofnumbers(label, proof)
     verifycompressedproof(env,label, assertion, labels, proofnumbers)
   else
     # Regular (uncompressed) proof
-    proof = Vector{Symbol}()
+    proof = Vector{String}()
     push!(proof,token)
     incomplete = false
     token = :dummytoken
     while !isempty(env.tokens)
-      token = shift!(env.tokens)
-      if token == Symbol("\$.")
+      token = popfirst!(env.tokens)
+      if token == "\$."
         break
       end
       push!(proof, token)
-      if token == Symbol("?")
+      if token == "?"
         incomplete = true
       elseif token == label
         metamath_error("Proof of theorem $label refers to itself")
@@ -552,7 +550,7 @@ function parsep!(env,label)
           " which is not an active statement")
       end
     end
-    if isempty(env.tokens) && token != Symbol("\$.")
+    if isempty(env.tokens) && token != "\$."
       metamath_error("Unfinished \$p statement")
     end
     if isempty(proof)
@@ -568,7 +566,7 @@ end
 
 # Parse $e statement
 function parsee!(env,label)
-  newhyp = readexpression!(env,'e', label, Symbol("\$."))
+  newhyp = readexpression!(env,'e', label, "\$.")
   env.hypotheses[label] = newhyp=>false
   push!(last(env.scopes).activehyp,label)
   return nothing
@@ -576,7 +574,7 @@ end
 
 # Parse $a statement
 function parsea!(env,label)
-  newaxiom = readexpression!(env,'a',label,Symbol("\$."))
+  newaxiom = readexpression!(env,'a',label,"\$.")
   assertion = constructassertion(env,label, newaxiom)
   env.assertions[label] = assertion
   return nothing
@@ -587,7 +585,7 @@ function parsef!(env,label)
   if isempty(env.tokens)
     metamath_error("Unfinished \$f statement $label")
   end
-  typetoken = shift!(env.tokens)
+  typetoken = popfirst!(env.tokens)
   if !(typetoken in env.constants)
     metamath_error("First symbol in \$f statement $label is $typetoken"*
       " which is not a constant")
@@ -595,7 +593,7 @@ function parsef!(env,label)
   if isempty(env.tokens)
     metamath_error("Unfinished \$f statement $label")
   end
-  variable = shift!(env.tokens)
+  variable = popfirst!(env.tokens)
   if !isactivevariable(env,variable)
     metamath_error("Second symbol in \$f statement $label is $variable"*
       " which is not an active variable")
@@ -607,8 +605,8 @@ function parsef!(env,label)
   if isempty(env.tokens)
     metamath_error("Unfinished \$f statement $label")
   end
-  token = shift!(env.tokens)
-  if token != Symbol("\$.")
+  token = popfirst!(env.tokens)
+  if token != "\$."
     metamath_error("Expected end of \$f statement but found $token")
   end
   newhyp = Expression()
@@ -634,14 +632,14 @@ function parselabel!(env,label)
   if isempty(env.tokens)
     metamath_error("Unfinished labeled statement")
   end
-  labeltype = shift!(env.tokens)
-  if labeltype == Symbol("\$p")
+  labeltype = popfirst!(env.tokens)
+  if labeltype == "\$p"
     parsep!(env,label)
-  elseif labeltype == Symbol("\$e")
+  elseif labeltype == "\$e"
     parsee!(env,label)
-  elseif labeltype == Symbol("\$a")
+  elseif labeltype == "\$a"
     parsea!(env,label)
-  elseif labeltype == Symbol("\$f")
+  elseif labeltype == "\$f"
     parsef!(env,label)
   else
     metamath_error("Unexpected token $labeltype encountered")
@@ -651,11 +649,11 @@ end
 
 # Parse $d statement
 function parsed!(env)
-  dvars = Set{Symbol}()
+  dvars = Set{String}()
   token = :dummytoken
   while !isempty(env.tokens)
-    token = shift!(env.tokens)
-    if token == Symbol("\$.")
+    token = popfirst!(env.tokens)
+    if token == "\$."
       break
     end
     if !isactivevariable(env,token)
@@ -667,7 +665,7 @@ function parsed!(env)
     end
     push!(dvars, token)
   end
-  if isempty(env.tokens) && token != Symbol("\$.")
+  if isempty(env.tokens) && token != "\$."
     metamath_error("Unfinished \$d statement")
   end
   if length(dvars)<2
@@ -685,8 +683,8 @@ function parsec!(env)
   token = ""
   listempty = true
   while !isempty(env.tokens)
-    token = shift!(env.tokens)
-    if token == Symbol("\$.")
+    token = popfirst!(env.tokens)
+    if token == "\$."
       break
     end
     listempty = false
@@ -704,7 +702,7 @@ function parsec!(env)
     end
     push!(env.constants, token)
   end
-  if isempty(env.tokens) && token != Symbol("\$.")
+  if isempty(env.tokens) && token != "\$."
     metamath_error("Unterminated \$c declaration")
   end
   if listempty
@@ -718,8 +716,8 @@ function parsev!(env)
   token = ""
   listempty = true
   while !isempty(env.tokens)
-    token = shift!(env.tokens)
-    if token == Symbol("\$.")
+    token = popfirst!(env.tokens)
+    if token == "\$."
       break
     end
     listempty = false
@@ -759,21 +757,21 @@ function mmverify!(env::Environment,filename::AbstractString;
   readtokens!(env,filename)
 
   while length(env.tokens)>0
-    token = shift!(env.tokens)
+    token = popfirst!(env.tokens)
     if islabeltoken(string(token))
       parselabel!(env,token)
-    elseif token==Symbol("\$d")
+    elseif token=="\$d"
       parsed!(env)
-    elseif token==Symbol("\${")
+    elseif token=="\${"
       push!(env.scopes,Scope())
-    elseif token==Symbol("\$}")
+    elseif token=="\$}"
       pop!(env.scopes)
       if isempty(env.scopes)
         metamath_error("\$} without corresponding \${")
       end
-    elseif token==Symbol("\$c")
+    elseif token=="\$c"
       parsec!(env)
-    elseif token==Symbol("\$v")
+    elseif token=="\$v"
       parsev!(env)
     else
       metamath_error("Unexpected token $token encountered")
@@ -782,8 +780,7 @@ function mmverify!(env::Environment,filename::AbstractString;
   if length(env.scopes)>1
     metamath_error("\${ without corresponding \$}")
   end
-  empty!(env.substitutionssrc)
-  empty!(env.substitutionsdst)
+  empty!(env.substitutions)
   env.dirty[1] = false
   return nothing
 end
@@ -829,8 +826,7 @@ function empty!(env::Environment)
   empty!(env.assertions)
   resize!(env.scopes,1)
   empty!(env.scopes[1])
-  empty!(env.substitutionssrc)
-  empty!(env.substitutionsdst)
+  empty!(env.substitutions)
   env.dirty[1] = false
   return env
 end

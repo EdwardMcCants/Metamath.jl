@@ -1,0 +1,11 @@
+authors = ["Edward McCants <27255145+EdwardMcCants@users.noreply.github.com>"]
+name = "Metamath"
+uuid = "78772d0c-6eaa-11e9-3962-8160f9b01885"
+version = "0.1.0"
+
+[deps]
+Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
+Unicode = "4ec0a83e-493e-50e2-b9ac-8f72acf5a8f5"
+
+[compat]
+julia = "1.0"
